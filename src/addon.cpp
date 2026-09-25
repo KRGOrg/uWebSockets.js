@@ -273,7 +273,13 @@ void uWS_setInteger(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    uint32_t value = Local<Integer>::Cast(args[1])->Value();
+    /* Local<Integer>::Cast is unchecked in a release build, so a non-number (undefined included)
+     * would become a bogus handle whose Value() reads whatever is there. */
+    if (!args[1]->IsNumber()) {
+        throwTypeError(args, "Passed argument is not a number.");
+        return;
+    }
+    uint32_t value = Local<Integer>::Cast(args[1])->Uint32Value(args.GetIsolate()->GetCurrentContext()).ToChecked();
 
     NativeString collection(args.GetIsolate(), args[2]);
     if (collection.isInvalid(args)) {
@@ -292,7 +298,12 @@ void uWS_incInteger(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    uint32_t change = Local<Integer>::Cast(args[1])->Value();
+    /* See uWS_setInteger */
+    if (!args[1]->IsNumber()) {
+        throwTypeError(args, "Passed argument is not a number.");
+        return;
+    }
+    uint32_t change = Local<Integer>::Cast(args[1])->Uint32Value(args.GetIsolate()->GetCurrentContext()).ToChecked();
 
     NativeString collection(args.GetIsolate(), args[2]);
     if (collection.isInvalid(args)) {
@@ -316,16 +327,28 @@ void uWS_getStringKeys(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    /* Held while the array is built: no JS callback is invoked in this loop */
-    std::lock_guard<std::mutex> guard(kvStoreMutex);
-    auto &keys = kvStoreString[std::string(collection.getString())];
+    /* Copy the keys out under the lock and build the V8 array only after releasing it:
+     * Array::Set can run JS (the array is created with no own elements, so storing index 0..n-1
+     * walks the prototype chain and can call a user accessor), and JS that runs while
+     * kvStoreMutex is held can re-enter a KV function and block forever on this non-recursive
+     * mutex. The lookup stays inside the guard: operator[] default-inserts the collection, which
+     * must stay atomic and observable the same way it was. */
+    std::vector<std::string> keysCopy;
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        auto &keys = kvStoreString[std::string(collection.getString())];
+        keysCopy.reserve(keys.size());
+        for (auto &p : keys) {
+            keysCopy.push_back(p.first);
+        }
+    }
 
-    Local<Array> stringKeys = Array::New(args.GetIsolate(), keys.size());
+    Local<Array> stringKeys = Array::New(args.GetIsolate(), keysCopy.size());
 
     int offset = 0;
 
-    for (auto p : keys) {
-        stringKeys->Set(args.GetIsolate()->GetCurrentContext(), offset++, String::NewFromUtf8(args.GetIsolate(), p.first.data(), NewStringType::kNormal, p.first.length()).ToLocalChecked()).IsNothing();
+    for (auto &key : keysCopy) {
+        stringKeys->Set(args.GetIsolate()->GetCurrentContext(), offset++, String::NewFromUtf8(args.GetIsolate(), key.data(), NewStringType::kNormal, key.length()).ToLocalChecked()).IsNothing();
     }
 
     args.GetReturnValue().Set(stringKeys);
@@ -338,16 +361,23 @@ void uWS_getIntegerKeys(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    /* Held while the array is built: no JS callback is invoked in this loop */
-    std::lock_guard<std::mutex> guard(kvStoreMutex);
-    auto &keys = kvStoreInteger[std::string(collection.getString())];
+    /* Same split as getStringKeys: copy under the lock, build the V8 array after it. */
+    std::vector<std::string> keysCopy;
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        auto &keys = kvStoreInteger[std::string(collection.getString())];
+        keysCopy.reserve(keys.size());
+        for (auto &p : keys) {
+            keysCopy.push_back(p.first);
+        }
+    }
 
-    Local<Array> integerKeys = Array::New(args.GetIsolate(), keys.size());
+    Local<Array> integerKeys = Array::New(args.GetIsolate(), keysCopy.size());
 
     int offset = 0;
 
-    for (auto p : keys) {
-        integerKeys->Set(args.GetIsolate()->GetCurrentContext(), offset++, String::NewFromUtf8(args.GetIsolate(), p.first.data(), NewStringType::kNormal, p.first.length()).ToLocalChecked()).IsNothing();
+    for (auto &key : keysCopy) {
+        integerKeys->Set(args.GetIsolate()->GetCurrentContext(), offset++, String::NewFromUtf8(args.GetIsolate(), key.data(), NewStringType::kNormal, key.length()).ToLocalChecked()).IsNothing();
     }
 
     args.GetReturnValue().Set(integerKeys);

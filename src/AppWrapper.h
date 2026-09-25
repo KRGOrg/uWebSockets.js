@@ -57,7 +57,38 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
 
     /* Get the behavior object */
     if (args.Length() == 2) {
+        /* Reject a non-object before Local<Object>::Cast, which is unchecked in a release build
+         * and would produce a bogus object handle for null/undefined/a primitive. */
+        if (!args[1]->IsObject()) {
+            throwTypeError(args, "uWS.App.ws behavior must be an object");
+            return;
+        }
         Local<Object> behaviorObject = Local<Object>::Cast(args[1]);
+
+        /* Reads one optional callback. Exactly one of the three outcomes is preserved:
+         *  - undefined (the property is absent): Reset the undefined VALUE, exactly as before.
+         *    The seven "!= Undefined(isolate)" tests below and the close lambda - which builds
+         *    Local<Function>::New BEFORE its IsUndefined() test - rely on an undefined-valued
+         *    persistent; leaving the persistent EMPTY instead would make New return an empty
+         *    handle and IsUndefined() dereference it.
+         *  - a function: Reset it.
+         *  - anything else: it would otherwise become a bogus Local<Function>, so reject it (and
+         *    do not register the route) with the same error style as the other wrappers. */
+        auto readCallback = [isolate, &behaviorObject, &args](const char *name, UniquePersistent<Function> &pf) {
+            Local<Value> value;
+            if (!behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, name, NewStringType::kNormal).ToLocalChecked()).ToLocal(&value)) {
+                /* An accessor on the behavior object threw; the exception is pending and the
+                 * route must not be registered. */
+                return false;
+            }
+            if (!value->IsUndefined() && !value->IsFunction()) {
+                /* Same error as every other callback check (res.onData, req.forEach, ...) */
+                throwTypeError(args, "Passed callback is not a valid function.");
+                return false;
+            }
+            pf.Reset(isolate, Local<Function>::Cast(value));
+            return true;
+        };
 
         /* maxPayloadLength or default */
         MaybeLocal<Value> maybeMaxPayloadLength = behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "maxPayloadLength", NewStringType::kNormal).ToLocalChecked());
@@ -103,23 +134,41 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
         }
 
         /* Upgrade */
-        upgradePf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "upgrade", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("upgrade", upgradePf)) {
+            return;
+        }
         /* Open */
-        openPf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "open", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("open", openPf)) {
+            return;
+        }
         /* Message */
-        messagePf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "message", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("message", messagePf)) {
+            return;
+        }
         /* Drain */
-        drainPf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "drain", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("drain", drainPf)) {
+            return;
+        }
         /* Close */
-        closePf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "close", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("close", closePf)) {
+            return;
+        }
         /* Dropped */
-        droppedPf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "dropped", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("dropped", droppedPf)) {
+            return;
+        }
         /* Ping */
-        pingPf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "ping", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("ping", pingPf)) {
+            return;
+        }
         /* Pong */
-        pongPf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "pong", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("pong", pongPf)) {
+            return;
+        }
     	/* Subscription */
-        subscriptionPf.Reset(args.GetIsolate(), Local<Function>::Cast(behaviorObject->Get(isolate->GetCurrentContext(), String::NewFromUtf8(isolate, "subscription", NewStringType::kNormal).ToLocalChecked()).ToLocalChecked()));
+        if (!readCallback("subscription", subscriptionPf)) {
+            return;
+        }
 
     }
 
@@ -333,9 +382,16 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
  * registration time and the per-request handler parses that copy, so JS cannot mutate the
  * bytes after this check - which is what makes validating once, up front, sound.
  * Opcodes 1 (WRITE_HEADER) and 7 (WRITE_STATUS) are held to the same header/status rules
- * as HttpResponse, since the C++ path writes those bytes straight to the wire. */
+ * as HttpResponse, since the C++ path writes those bytes straight to the wire.
+ * END (opcode 0) must be the last instruction and must appear exactly once: END is what calls
+ * res->end, and a handler that never responds makes uWS terminate the process. Without this
+ * rule an instruction after END was executed too, so a stream could inject a header (or a
+ * second response) after the response had already been ended. The builder writes END as
+ * opcode 0 plus a 2-byte little-endian length, so a well-formed stream ends exactly at its last
+ * byte. */
 static bool validateDeclarativeResponse(Isolate *isolate, std::string_view instructions) {
     size_t offset = 0;
+    bool sawEnd = false;
 
     auto fail = [isolate](const std::string &message) {
         isolate->ThrowException(v8::Exception::Error(String::NewFromUtf8(isolate, message.c_str(), NewStringType::kNormal).ToLocalChecked()));
@@ -363,11 +419,24 @@ static bool validateDeclarativeResponse(Isolate *isolate, std::string_view instr
 
     while (offset < instructions.length()) {
         uint8_t opcode = (uint8_t) instructions[offset++];
+        if (sawEnd) {
+            /* END is final. Name the two ways a stream can violate that: a second END, and any
+             * instruction emitted after END. */
+            if (opcode == 0) {
+                return fail("DeclarativeResponse has more than one END instruction");
+            }
+            return fail("DeclarativeResponse instruction after END");
+        }
         std::string_view first;
         std::string_view second;
 
         switch (opcode) {
             case 0: /* END */
+                if (!readField(2, first)) {
+                    return fail("Truncated DeclarativeResponse instruction stream");
+                }
+                sawEnd = true;
+                break;
             case 5: /* WRITE */
                 if (!readField(2, first)) {
                     return fail("Truncated DeclarativeResponse instruction stream");
@@ -401,6 +470,12 @@ static bool validateDeclarativeResponse(Isolate *isolate, std::string_view instr
             default:
                 return fail("Unknown DeclarativeResponse opcode " + std::to_string((int) opcode));
         }
+    }
+
+    if (!sawEnd) {
+        /* Execution would never call res->end, and a handler that returns without responding
+         * makes the engine call std::terminate, so a stream without END is refused here. */
+        return fail("DeclarativeResponse is missing its END instruction");
     }
 
     return true;
@@ -557,6 +632,15 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
                         if (!ended) {
                             res->end();
                         }
+                        break;
+                    }
+
+                    if (ended) {
+                        /* END is the final instruction by construction (registration-time
+                         * validation rejects any instruction after END and any second END), so
+                         * nothing may be executed past it - the switch's break only leaves the
+                         * switch, this leaves the instruction loop with END as the last thing
+                         * written. */
                         break;
                     }
                 }

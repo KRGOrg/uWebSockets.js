@@ -47,6 +47,13 @@ struct HttpRequestWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *req = getHttpRequest<QUIC>(args);
         if (req) {
+            /* Reject a non-function before Local<Function>::Cast, which is unchecked in a
+             * release build: casting null produces a bogus handle whose failure mode depends on
+             * how it is called (measured: it happened to throw TypeError). */
+            if (!args[0]->IsFunction()) {
+                throwTypeError(args, "Passed callback is not a valid function.");
+                return;
+            }
             Local<Function> cb = Local<Function>::Cast(args[0]);
 
             for (auto p : *req) {

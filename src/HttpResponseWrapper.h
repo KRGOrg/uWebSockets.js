@@ -461,19 +461,31 @@ struct HttpResponseWrapper {
     }
 
     /* Takes string or arraybuffer, returns this.
-     * The status line is written one byte per code unit (latin-1), like Node, so anything above
-     * U+00FF is rejected before encoding and the encoded bytes are validated for CR/LF. */
+     * A JS String is encoded as UTF-8, which is what Node writes when the head is flushed by a
+     * string body ('caf\u00e9' -> c3 a9); pure ASCII is byte-identical either way, through the
+     * proof-based fast path in NativeString. An ArrayBuffer/ArrayBufferView argument is passed
+     * through verbatim, which is the opt-in for exact bytes (the latin-1 bytes Node writes for a
+     * Buffer or empty body). Anything above U+00FF is rejected before encoding: under UTF-8 those
+     * code points become two obs-text bytes that the byte-level validator would accept, while
+     * Node throws ERR_INVALID_CHAR. */
     template <int SSL>
     static void res_writeStatus(const FunctionCallbackInfo<Value> &args) {
         auto *res = getHttpResponse<SSL>(args);
-            if (res) {
+        if (res) {
             if (args[0]->IsString() && !isLatin1String(args[0])) {
                 throwTypeError(args, "Characters above U+00FF are not allowed in a status line or header");
                 return;
             }
 
-            NativeStringOneByte data(args.GetIsolate(), args[0]);
+            NativeString data(args.GetIsolate(), args[0]);
             if (data.isInvalid(args)) {
+                return;
+            }
+
+            /* The engine narrows a status line to int before writing it; a line that does not
+             * fit is refused here rather than truncated to a negative-length write. */
+            if (data.getString().length() > (size_t) INT_MAX) {
+                throwRangeError(args, "Status line is too long to write");
                 return;
             }
 
@@ -610,9 +622,13 @@ struct HttpResponseWrapper {
     }
 
     /* Takes key, value. Returns this.
-     * Header names and values are written one byte per code unit (latin-1), like Node; anything
-     * above U+00FF is rejected before encoding and the encoded bytes are validated so a header
-     * name cannot carry ':'/SP/CR/LF and a value cannot carry control characters. */
+     * A JS String is encoded as UTF-8 (the encoding Node uses for a head flushed by a string
+     * body); pure ASCII is byte-identical through NativeString's proof-based fast path. An
+     * ArrayBuffer/ArrayBufferView argument is passed through verbatim, which is the opt-in for
+     * exact bytes. Anything above U+00FF is rejected before encoding, because under UTF-8 it
+     * would become two obs-text bytes that the byte-level validator accepts while Node throws
+     * ERR_INVALID_CHAR. The encoded bytes are validated so a header name cannot carry
+     * ':'/SP/CR/LF and a value cannot carry control characters. */
     template <int PROTOCOL>
     static void res_writeHeader(const FunctionCallbackInfo<Value> &args) {
         Isolate *isolate = args.GetIsolate();
@@ -623,12 +639,19 @@ struct HttpResponseWrapper {
                 return;
             }
 
-            NativeStringOneByte header(args.GetIsolate(), args[0]);
+            NativeString header(args.GetIsolate(), args[0]);
             if (header.isInvalid(args)) {
                 return;
             }
-            NativeStringOneByte value(args.GetIsolate(), args[1]);
+            NativeString value(args.GetIsolate(), args[1]);
             if (value.isInvalid(args)) {
+                return;
+            }
+
+            /* The engine narrows a header line to int before writing it; refuse what does not
+             * fit instead of letting the cast wrap into a negative-length write. */
+            if (header.getString().length() > (size_t) INT_MAX || value.getString().length() > (size_t) INT_MAX) {
+                throwRangeError(args, "Header name or value is too long to write");
                 return;
             }
 

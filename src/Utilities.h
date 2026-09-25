@@ -24,6 +24,7 @@
 using namespace v8;
 
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -174,6 +175,11 @@ static inline void throwTypeError(const FunctionCallbackInfo<Value> &args, const
     args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::TypeError(String::NewFromUtf8(isolate, message, NewStringType::kNormal).ToLocalChecked())));
 }
 
+static inline void throwRangeError(const FunctionCallbackInfo<Value> &args, const char *message) {
+    Isolate *isolate = args.GetIsolate();
+    args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::RangeError(String::NewFromUtf8(isolate, message, NewStringType::kNormal).ToLocalChecked())));
+}
+
 /* Header names must be a non-empty RFC 9110 token (tchar); ':', SP, HTAB, CR, LF and every byte
  * below 0x21 or at/above 0x7F are rejected, which is what Node rejects with ERR_INVALID_HTTP_TOKEN. */
 static inline bool isValidHeaderName(std::string_view name) {
@@ -211,7 +217,10 @@ static inline bool isValidHeaderValue(std::string_view value) {
 
 /* Three ASCII digits, then optionally a single SP and a reason phrase with field-value rules.
  * The space is deliberately not required: writeStatus('200') has always emitted "HTTP/1.1 200\r\n"
- * and that must not change. Values above 0xFF must be rejected before one-byte encoding. */
+ * and that must not change. The numeric value must be >= 100: Node throws
+ * ERR_HTTP_INVALID_STATUS_CODE for a code below 100, so '000' and '099' (the three-digit forms a
+ * caller builds) are rejected the way Node rejects 0 and 99, while 100-999 stay accepted.
+ * Values above 0xFF must be rejected before one-byte encoding. */
 static inline bool isValidStatusLine(std::string_view status) {
     if (status.length() < 3) {
         return false;
@@ -220,6 +229,9 @@ static inline bool isValidStatusLine(std::string_view status) {
         if (status[i] < '0' || status[i] > '9') {
             return false;
         }
+    }
+    if ((status[0] - '0') * 100 + (status[1] - '0') * 10 + (status[2] - '0') < 100) {
+        return false;
     }
     if (status.length() == 3) {
         return true;
@@ -347,23 +359,49 @@ public:
         } else if (value->IsString()) {
             Local<String> string = Local<String>::Cast(value);
 
-            /* Bodies are UTF-8. REPLACE_INVALID_UTF8 turns an unpaired surrogate into U+FFFD
-             * (both are 3 bytes, so Utf8Length/Utf8LengthV2 stays correct). The AllowStringView
-             * template parameter is retained only for source compatibility; it no longer selects
-             * an encoding - writeStatus/writeHeader use NativeStringOneByte instead. */
+            /* A JS String is UTF-8: that is what Node's head encoding is for every body shape
+             * whose first flushing send is a string, and what writeStatus/writeHeader now emit by
+             * default. An ArrayBuffer(View) argument keeps going out verbatim (below), which is
+             * how a caller asks for exact bytes. REPLACE_INVALID_UTF8 turns an unpaired surrogate
+             * into U+FFFD (both are 3 bytes, so Utf8Length/Utf8LengthV2 stays correct). The
+             * AllowStringView template parameter is retained only for source compatibility; it no
+             * longer selects an encoding. */
 
             #if (V8_MAJOR_VERSION >= 14)
-                // Fallback
-                length = string->Utf8LengthV2(isolate);
-                data = alloc(length);
-                allocated = true;
-                string->WriteUtf8V2(isolate, data, length, String::WriteFlags::kReplaceInvalidUtf8);
+                size_t utf8Length = string->Utf8LengthV2(isolate);
+                if (string->IsOneByte() && (size_t) string->Length() == utf8Length) {
+                    /* Fast path, provably byte-identical to the UTF-8 encoding below: a one-byte
+                     * string whose UTF-8 length equals its code-unit count has no code unit
+                     * >= 0x80 (each of those needs two UTF-8 bytes), so it is pure ASCII and
+                     * WriteOneByteV2 and WriteUtf8V2 produce the same bytes.
+                     * ContainsOnlyOneByte() alone is NOT this proof: it is true for 'caf\u00e9',
+                     * which is two UTF-8 bytes for one code unit. */
+                    length = utf8Length;
+                    data = alloc(length);
+                    allocated = true;
+                    string->WriteOneByteV2(isolate, 0, (uint32_t) string->Length(), (uint8_t *) data);
+                } else {
+                    // Fallback
+                    length = utf8Length;
+                    data = alloc(length);
+                    allocated = true;
+                    string->WriteUtf8V2(isolate, data, length, String::WriteFlags::kReplaceInvalidUtf8);
+                }
             #else
-                // Fallback
-                length = string->Utf8Length(isolate);
-                data = alloc(length);
-                allocated = true;
-                string->WriteUtf8(isolate, data, length, nullptr, String::WriteOptions::REPLACE_INVALID_UTF8 | String::WriteOptions::NO_NULL_TERMINATION);
+                int utf8Length = string->Utf8Length(isolate);
+                if (string->IsOneByte() && string->Length() == utf8Length) {
+                    /* See the fast-path comment above; identical proof, legacy API */
+                    length = (size_t) utf8Length;
+                    data = alloc(length);
+                    allocated = true;
+                    string->WriteOneByte(isolate, (uint8_t *) data, 0, utf8Length, String::WriteOptions::NO_NULL_TERMINATION);
+                } else {
+                    // Fallback
+                    length = (size_t) utf8Length;
+                    data = alloc(length);
+                    allocated = true;
+                    string->WriteUtf8(isolate, data, utf8Length, nullptr, String::WriteOptions::REPLACE_INVALID_UTF8 | String::WriteOptions::NO_NULL_TERMINATION);
+                }
             #endif
 
 
@@ -406,11 +444,14 @@ public:
     }
 };
 
-/* One-byte (latin-1) sibling of NativeString, for the wire paths that Node writes as latin-1:
- * the status line and header names/values. One code unit becomes exactly one byte, so a value
- * above U+00FF would be silently truncated - callers must reject such strings with
- * isLatin1String() before encoding. ArrayBuffer/SharedArrayBuffer/ArrayBufferView pass through
- * unchanged, which is how callers hand over raw header bytes. Own pool and ref count: it must not
+/* One-byte (latin-1) sibling of NativeString: one code unit becomes exactly one byte, which is
+ * what Node writes when the head is flushed by a Buffer/empty body. The head paths
+ * (res.writeStatus/res.writeHeader) no longer use it as their default - a JS String is UTF-8
+ * there, because that is what Node emits for a string body - but it is kept as the explicit
+ * one-byte encoder, and the raw-bytes opt-in is not this class: an ArrayBuffer/SharedArrayBuffer/
+ * ArrayBufferView argument to NativeString passes through unchanged.
+ * A value above U+00FF would be silently truncated, so callers must reject such strings with
+ * isLatin1String() before encoding. Own pool and ref count: it must not
  * share bookkeeping with NativeString because the two are used in different scopes. */
 class NativeStringOneByte {
     char *data;
