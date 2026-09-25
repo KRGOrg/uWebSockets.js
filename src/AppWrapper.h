@@ -18,6 +18,9 @@
 #include "App.h"
 #include <v8.h>
 #include "Utilities.h"
+#include <memory>
+#include <mutex>
+#include <unordered_set>
 using namespace v8;
 
 /* uWS.App.ws('/pattern', behavior) */
@@ -254,8 +257,12 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
             HandleScope hs(isolate);
 
             PerSocketData *perSocketData = (PerSocketData *) ws->getUserData();
-            Local<Value> argv[4] = {Local<Object>::New(isolate, perSocketData->socketPf), ArrayBuffer_New(isolate, (void *) topic.data(), topic.length()), Integer::New(isolate, newCount), Integer::New(isolate, oldCount)};
+            Local<ArrayBuffer> topicArrayBuffer = ArrayBuffer_New(isolate, (void *) topic.data(), topic.length());
+            Local<Value> argv[4] = {Local<Object>::New(isolate, perSocketData->socketPf), topicArrayBuffer, Integer::New(isolate, newCount), Integer::New(isolate, oldCount)};
             CallJS(isolate, Local<Function>::New(isolate, subscriptionPf), 4, argv);
+
+            /* Important: we clear the ArrayBuffer to make sure it is not invalidly used after return */
+            topicArrayBuffer->Detach();
         };
     }
 
@@ -265,8 +272,12 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
             HandleScope hs(isolate);
 
             PerSocketData *perSocketData = (PerSocketData *) ws->getUserData();
-            Local<Value> argv[2] = {Local<Object>::New(isolate, perSocketData->socketPf), ArrayBuffer_New(isolate, (void *) message.data(), message.length())};
+            Local<ArrayBuffer> messageArrayBuffer = ArrayBuffer_New(isolate, (void *) message.data(), message.length());
+            Local<Value> argv[2] = {Local<Object>::New(isolate, perSocketData->socketPf), messageArrayBuffer};
             CallJS(isolate, Local<Function>::New(isolate, pingPf), 2, argv);
+
+            /* Important: we clear the ArrayBuffer to make sure it is not invalidly used after return */
+            messageArrayBuffer->Detach();
         };
     }
 
@@ -276,8 +287,12 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
             HandleScope hs(isolate);
 
             PerSocketData *perSocketData = (PerSocketData *) ws->getUserData();
-            Local<Value> argv[2] = {Local<Object>::New(isolate, perSocketData->socketPf), ArrayBuffer_New(isolate, (void *) message.data(), message.length())};
+            Local<ArrayBuffer> messageArrayBuffer = ArrayBuffer_New(isolate, (void *) message.data(), message.length());
+            Local<Value> argv[2] = {Local<Object>::New(isolate, perSocketData->socketPf), messageArrayBuffer};
             CallJS(isolate, Local<Function>::New(isolate, pongPf), 2, argv);
+
+            /* Important: we clear the ArrayBuffer to make sure it is not invalidly used after return */
+            messageArrayBuffer->Detach();
         };
     }
 
@@ -313,10 +328,95 @@ void uWS_App_ws(const FunctionCallbackInfo<Value> &args) {
     args.GetReturnValue().Set(args.This());
 }
 
+/* One-time validation of a DeclarativeResponse instruction stream, exactly as built by
+ * src/uws.js (opcode, length, payload). The stream is copied into a std::string at
+ * registration time and the per-request handler parses that copy, so JS cannot mutate the
+ * bytes after this check - which is what makes validating once, up front, sound.
+ * Opcodes 1 (WRITE_HEADER) and 7 (WRITE_STATUS) are held to the same header/status rules
+ * as HttpResponse, since the C++ path writes those bytes straight to the wire. */
+static bool validateDeclarativeResponse(Isolate *isolate, std::string_view instructions) {
+    size_t offset = 0;
+
+    auto fail = [isolate](const std::string &message) {
+        isolate->ThrowException(v8::Exception::Error(String::NewFromUtf8(isolate, message.c_str(), NewStringType::kNormal).ToLocalChecked()));
+        return false;
+    };
+
+    /* Reads one length-prefixed field. lengthBytes is 1 or 2 (little-endian), matching
+     * _appendInstruction / _appendInstructionWithLength in src/uws.js. */
+    auto readField = [&offset, instructions](int lengthBytes, std::string_view &field) {
+        if (instructions.length() - offset < (size_t) lengthBytes) {
+            return false;
+        }
+        size_t length = (uint8_t) instructions[offset];
+        if (lengthBytes == 2) {
+            length |= ((size_t) (uint8_t) instructions[offset + 1]) << 8;
+        }
+        offset += lengthBytes;
+        if (instructions.length() - offset < length) {
+            return false;
+        }
+        field = instructions.substr(offset, length);
+        offset += length;
+        return true;
+    };
+
+    while (offset < instructions.length()) {
+        uint8_t opcode = (uint8_t) instructions[offset++];
+        std::string_view first;
+        std::string_view second;
+
+        switch (opcode) {
+            case 0: /* END */
+            case 5: /* WRITE */
+                if (!readField(2, first)) {
+                    return fail("Truncated DeclarativeResponse instruction stream");
+                }
+                break;
+            case 2: /* WRITE_BODY */
+                break;
+            case 1: /* WRITE_HEADER */
+                if (!readField(1, first) || !readField(1, second)) {
+                    return fail("Truncated DeclarativeResponse instruction stream");
+                }
+                if (!isValidHeaderName(first) || !isValidHeaderValue(second)) {
+                    return fail("Invalid character in header content");
+                }
+                break;
+            case 7: /* WRITE_STATUS */
+                if (!readField(1, first)) {
+                    return fail("Truncated DeclarativeResponse instruction stream");
+                }
+                if (!isValidStatusLine(first)) {
+                    return fail("Invalid character in header content");
+                }
+                break;
+            case 3: /* WRITE_QUERY_VALUE */
+            case 4: /* WRITE_HEADER_VALUE */
+            case 6: /* WRITE_PARAMETER_VALUE */
+                if (!readField(1, first)) {
+                    return fail("Truncated DeclarativeResponse instruction stream");
+                }
+                break;
+            default:
+                return fail("Unknown DeclarativeResponse opcode " + std::to_string((int) opcode));
+        }
+    }
+
+    return true;
+}
+
 /* This method wraps get, post and all http methods */
 template <typename APP, typename F>
 void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
     APP *app = (APP *) getInternalPointer(args.This());//->GetAlignedPointerFromInternalField(0);
+
+    /* Note on duplicate framing headers: a request carrying two Content-Length (or two
+     * Transfer-Encoding) headers is rejected with 400 by the HTTP framer in
+     * uWebSockets/src/HttpParser.h before any handler runs, so no duplicate-header scan
+     * belongs here - it would be unreachable code costing a comparison per request.
+     * HttpRequest::getHeader keeps its documented first-match-wins behaviour and the
+     * single, well-formed Content-Length is returned exactly as sent. */
 
     /* Pattern */
     NativeString pattern(args.GetIsolate(), args[0]);
@@ -338,108 +438,124 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
             return;
         }
 
+        /* Validate the whole instruction stream once, up front: a JS-supplied buffer must
+         * never be able to make the parser read out of bounds, wrap a length, or loop
+         * forever on an unknown opcode */
+        if (!validateDeclarativeResponse(args.GetIsolate(), constantString.getString())) {
+            return;
+        }
+
         (app->*f)(std::string(pattern.getString()), [response = std::string(constantString.getString().data(), constantString.getString().length())](auto *res, auto *req) {
             
 
             if constexpr (!std::is_same<APP, uWS::H3App>::value) {
 
-                /* Parse the DeclarativeResponse */
+                /* Parse the DeclarativeResponse. The stream was validated in full at
+                 * registration time, so every read below is in bounds; the checks are
+                 * kept as a cheap guard and an unknown opcode can no longer spin. */
                 std::string_view remainingInstructions(response.data(), response.length());
+                bool ended = false;
+
+                /* Reads one length-prefixed field; false when the stream is too short */
+                auto readField = [&remainingInstructions](int lengthBytes, std::string_view &field) {
+                    if (remainingInstructions.length() < (size_t) lengthBytes) {
+                        return false;
+                    }
+                    size_t length = (uint8_t) remainingInstructions[0];
+                    if (lengthBytes == 2) {
+                        length |= ((size_t) (uint8_t) remainingInstructions[1]) << 8;
+                    }
+                    remainingInstructions.remove_prefix(lengthBytes);
+                    if (remainingInstructions.length() < length) {
+                        return false;
+                    }
+                    field = remainingInstructions.substr(0, length);
+                    remainingInstructions.remove_prefix(length);
+                    return true;
+                };
+
                 while (remainingInstructions.length()) {
-                    switch(remainingInstructions[0]) {
+                    uint8_t opcode = (uint8_t) remainingInstructions[0];
+                    remainingInstructions.remove_prefix(1); // Skip opCode
+
+                    std::string_view first;
+                    std::string_view second;
+                    bool valid = true;
+
+                    switch (opcode) {
                         case 0: {
                             /* opCode END */
-                            uint16_t length;
-                            memcpy(&length, remainingInstructions.data() + 1, 2);
-                            remainingInstructions.remove_prefix(3); // Skip opCode and length bytes
-                            
-                            res->end(remainingInstructions.substr(0, length));
-                            remainingInstructions.remove_prefix(length);
+                            valid = readField(2, first);
+                            if (valid) {
+                                res->end(first);
+                                ended = true;
+                            }
                         }
                         break;
                         case 1: {
                             /* opCode WRITE_HEADER */
-                            uint8_t keyLength;
-                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
-                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
-                            
-                            std::string_view keyString(remainingInstructions.data(), keyLength);
-                            remainingInstructions.remove_prefix(keyLength);
-
-                            uint8_t valueLength;
-                            memcpy(&valueLength, remainingInstructions.data(), 1);
-                            remainingInstructions.remove_prefix(1); // Skip value length bytes
-                            
-                            std::string_view valueString(remainingInstructions.data(), valueLength);
-                            remainingInstructions.remove_prefix(valueLength);
-
-                            res->writeHeader(keyString, valueString);
+                            valid = readField(1, first) && readField(1, second);
+                            if (valid) {
+                                res->writeHeader(first, second);
+                            }
                         }
                         break;
                         case 2: {
                             /* opCode WRITE_BODY */
-                            remainingInstructions.remove_prefix(1); // Skip opCode
-                            //res->writeBody();
                         }
                         break;
                         case 3: {
                             /* opCode WRITE_QUERY_VALUE */
-                            uint8_t keyLength;
-                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
-                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
-                            
-                            std::string_view keyString(remainingInstructions.data(), keyLength);
-                            remainingInstructions.remove_prefix(keyLength);
-
-                            res->write(req->getQuery(keyString));
+                            valid = readField(1, first);
+                            if (valid) {
+                                res->write(req->getQuery(first));
+                            }
                         }
                         break;
                         case 4: {
                             /* opCode WRITE_HEADER_VALUE */
-                            uint8_t keyLength;
-                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
-                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
-                            
-                            std::string_view keyString(remainingInstructions.data(), keyLength);
-                            remainingInstructions.remove_prefix(keyLength);
-
-                            res->write(req->getHeader(keyString));
+                            valid = readField(1, first);
+                            if (valid) {
+                                res->write(req->getHeader(first));
+                            }
                         }
                         break;
                         case 5: {
                             /* opCode WRITE */
-                            uint16_t length;
-                            memcpy(&length, remainingInstructions.data() + 1, 2);
-                            remainingInstructions.remove_prefix(3); // Skip opCode and length bytes
-                            
-                            std::string_view valueString(remainingInstructions.data(), length);
-                            remainingInstructions.remove_prefix(length);
-
-                            res->write(valueString);
+                            valid = readField(2, first);
+                            if (valid) {
+                                res->write(first);
+                            }
                         }
                         break;
                         case 6: {
                             /* opCode WRITE_PARAMETER_VALUE */
-                            uint8_t keyLength;
-                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
-                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
-                            
-                            std::string_view keyString(remainingInstructions.data(), keyLength);
-                            remainingInstructions.remove_prefix(keyLength);
-
-                            res->write(req->getParameter(keyString));
+                            valid = readField(1, first);
+                            if (valid) {
+                                res->write(req->getParameter(first));
+                            }
                         }
                         break;
                         case 7: {
                             /* opCode WRITE_STATUS */
-                            uint8_t statusLength;
-                            memcpy(&statusLength, remainingInstructions.data() + 1, 1);
-                            remainingInstructions.remove_prefix(2); // Skip opCode and status length bytes
-                            
-                            std::string_view statusString(remainingInstructions.data(), statusLength);
-                            remainingInstructions.remove_prefix(statusLength);
+                            valid = readField(1, first);
+                            if (valid) {
+                                res->writeStatus(first);
+                            }
+                        }
+                        break;
+                        default: {
+                            /* Unknown opcode; registration-time validation rejects this */
+                            valid = false;
+                        }
+                        break;
+                    }
 
-                            res->writeStatus(statusString);
+                    if (!valid) {
+                        /* Truncated or unknown instruction: answer the request instead of
+                         * leaving the connection hanging. Unreachable for validated streams. */
+                        if (!ended) {
+                            res->end();
                         }
                         break;
                     }
@@ -753,13 +869,101 @@ std::pair<uWS::SocketContextOptions, bool> readOptionsObject(const FunctionCallb
     return {options, true};
 }
 
+/* Registry of apps that are alive in this process, keyed by pointer, used to validate the
+ * descriptors passed to addChildAppDescriptor/removeChildAppDescriptor. It is process-wide
+ * rather than per isolate/context because the documented flow hands a descriptor to another
+ * worker thread of the same process (examples/WorkerThreads.mjs: the worker does
+ * parentPort.postMessage(app.getDescriptor()) and the main thread does
+ * acceptorApp.addChildAppDescriptor(descriptor)).
+ * Only App/SSLApp objects are registered: H3 apps never enter perContextData->apps/sslApps
+ * and the descriptor functions are not registered for them (see the if constexpr guard at
+ * the bottom of uWS_App), so no entry can outlive the context that created it. */
+static std::unordered_set<const void *> &liveApps() {
+    static std::unordered_set<const void *> apps;
+    return apps;
+}
+
+static std::mutex &liveAppsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static void registerLiveApp(const void *app) {
+    std::lock_guard<std::mutex> guard(liveAppsMutex());
+    liveApps().insert(app);
+}
+
+static void unregisterLiveApp(const void *app) {
+    std::lock_guard<std::mutex> guard(liveAppsMutex());
+    liveApps().erase(app);
+}
+
+static bool isLiveApp(const void *app) {
+    std::lock_guard<std::mutex> guard(liveAppsMutex());
+    return liveApps().count(app) != 0;
+}
+
+/* Removes every app owned by this context from the process-wide descriptor registry.
+ * Called from the addon cleanup hook (src/addon.cpp) before the apps are destroyed. */
+static void uWS_unregisterLiveAppsFor(PerContextData *perContextData) {
+    for (auto &app : perContextData->apps) {
+        unregisterLiveApp(app.get());
+    }
+    for (auto &app : perContextData->sslApps) {
+        unregisterLiveApp(app.get());
+    }
+}
+
+/* Reads a JS descriptor argument as an app pointer, or throws a catchable TypeError and
+ * returns false. A genuine descriptor (from getDescriptor) is the exact double
+ * representation of a live app pointer, so its bits can be copied out unchanged; any other
+ * number used to be cast straight to a pointer and dereferenced by uWS. */
+template <typename APP>
+static bool readAppDescriptor(const FunctionCallbackInfo<Value> &args, const char *functionName, APP *&receivingApp) {
+    Isolate *isolate = args.GetIsolate();
+    std::string message = std::string(functionName) + " requires a live descriptor from getDescriptor";
+
+    if (!args[0]->IsNumber()) {
+        args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::TypeError(String::NewFromUtf8(isolate, message.c_str(), NewStringType::kNormal).ToLocalChecked())));
+        return false;
+    }
+
+    double descriptor;
+    /* Unreachable for a primitive number (IsNumber rejects Number wrappers above), but a
+     * throwing valueOf must propagate its own exception instead of aborting the process */
+    if (!args[0]->NumberValue(isolate->GetCurrentContext()).To(&descriptor)) {
+        return false;
+    }
+
+    memcpy(&receivingApp, &descriptor, sizeof(receivingApp));
+
+    if (!isLiveApp((const void *) receivingApp)) {
+        args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::TypeError(String::NewFromUtf8(isolate, message.c_str(), NewStringType::kNormal).ToLocalChecked())));
+        return false;
+    }
+
+    return true;
+}
+
 template <typename APP>
 void uWS_App_adoptSocket(const FunctionCallbackInfo<Value> &args) {
     APP *app = (APP *) getInternalPointer(args.This());//->GetAlignedPointerFromInternalField(0);
 
     Isolate *isolate = args.GetIsolate();
 
-    int32_t fd = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+    /* The file descriptor must be a real integer in range; anything else used to be
+     * coerced and handed to uSockets unchecked */
+    if (!args[0]->IsInt32()) {
+        args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::TypeError(String::NewFromUtf8(isolate, "adoptSocket requires an integer file descriptor", NewStringType::kNormal).ToLocalChecked())));
+        return;
+    }
+
+    int32_t fd = args[0].As<Int32>()->Value();
+
+    if (fd < 0) {
+        args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::RangeError(String::NewFromUtf8(isolate, "adoptSocket requires a non-negative file descriptor", NewStringType::kNormal).ToLocalChecked())));
+        return;
+    }
 
     NativeString ip(isolate, args[1]);
     if (ip.isInvalid(args)) {
@@ -775,12 +979,10 @@ template <typename APP>
 void uWS_App_removeChildApp(const FunctionCallbackInfo<Value> &args) {
     APP *app = (APP *) getInternalPointer(args.This());//->GetAlignedPointerFromInternalField(0);
 
-    Isolate *isolate = args.GetIsolate();
-
-    double descriptor = args[0]->NumberValue(isolate->GetCurrentContext()).ToChecked();
-
     APP *receivingApp;
-    memcpy(&receivingApp, &descriptor, sizeof(receivingApp));
+    if (!readAppDescriptor(args, "removeChildAppDescriptor", receivingApp)) {
+        return;
+    }
 
     app->removeChildApp(receivingApp);
 
@@ -791,17 +993,12 @@ template <typename APP>
 void uWS_App_addChildApp(const FunctionCallbackInfo<Value> &args) {
     APP *app = (APP *) getInternalPointer(args.This());//->GetAlignedPointerFromInternalField(0);
 
-    Isolate *isolate = args.GetIsolate();
-
-    double descriptor = args[0]->NumberValue(isolate->GetCurrentContext()).ToChecked();
-
-
-    APP *receivingApp;// = (APP *) args[0]->ToObject(isolate->GetCurrentContext()).ToLocalChecked()->GetAlignedPointerFromInternalField(0);
-
-    memcpy(&receivingApp, &descriptor, sizeof(receivingApp));
+    APP *receivingApp;
+    if (!readAppDescriptor(args, "addChildAppDescriptor", receivingApp)) {
+        return;
+    }
 
     /* Todo: check the class type of args[0] must match class type of args.This() */
-    //if (args[0])
 
     //std::cout << "addChildApp: " << receivingApp << std::endl;
 
@@ -818,12 +1015,25 @@ void uWS_App_getDescriptor(const FunctionCallbackInfo<Value> &args) {
 
     static_assert(sizeof(double) >= sizeof(app));
 
-    //static thread_local std::unordered_set<UniquePersistent<Object>> persistentApps;
+    /* Keep exactly one persistent handle per app: it is what keeps the JS app object alive
+     * for as long as the descriptor may be used, and reusing it stops the per-call leak of
+     * a V8 global handle. The handles live in PerContextData and are released when the
+     * context is torn down (src/addon.cpp cleanup hook), i.e. before the isolate dies. */
+    PerContextData *perContextData = (PerContextData *) Local<External>::Cast(args.Data())->Value();
 
-    UniquePersistent<Object> *persistentApp = new UniquePersistent<Object>;
-    persistentApp->Reset(args.GetIsolate(), args.This());
+    bool found = false;
+    for (auto &descriptorEntry : perContextData->appDescriptors) {
+        if (descriptorEntry.first == (void *) app) {
+            found = true;
+            break;
+        }
+    }
 
-    //persistentApps.emplace(persistentApp);
+    if (!found) {
+        auto holder = std::make_unique<UniquePersistent<Object>>();
+        holder->Reset(isolate, args.This());
+        perContextData->appDescriptors.emplace_back((void *) app, std::move(holder));
+    }
 
     double descriptor = 0;
     memcpy(&descriptor, &app, sizeof(app));
@@ -1124,6 +1334,9 @@ void uWS_App(const FunctionCallbackInfo<Value> &args) {
         } else {
             perContextData->apps.emplace_back(app);
         }
+
+        /* Make the app addressable by descriptors on other threads of this process */
+        registerLiveApp(app);
 
     }
 

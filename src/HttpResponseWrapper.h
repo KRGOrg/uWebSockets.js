@@ -18,10 +18,102 @@
 #include "App.h"
 #include "Utilities.h"
 
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <vector>
+
 #include <v8.h>
 using namespace v8;
 
 thread_local int insideCorkCallback = 0;
+
+/* Upper bound for the vector pre-allocation hint in collectBody: the hint comes from the client's
+ * Content-Length, so it must never be used to size a reserve that the client fully controls. The
+ * collected bytes themselves are unaffected by the clamp, only the reserve. */
+static constexpr size_t COLLECT_BODY_MAX_RESERVE = 16 * 1024 * 1024;
+
+/* collectBody needs more state than fits in MoveOnlyFunction's 16-byte inline storage, so it owns
+ * exactly one heap allocation instead of letting the closure allocate one: this state. The stream
+ * wrapper below is one pointer (inline-eligible) and its destructor is what frees the state, i.e.
+ * the persistent handle and the accumulated vector, exactly once - including when the response is
+ * aborted, because HttpResponseData's destructor destroys its inStream. */
+struct CollectBodyState {
+    NothrowGlobal<Function> p;
+    std::unique_ptr<std::vector<char>> buffer;
+    bool overflow = false;
+    size_t maxSize = 0;
+};
+
+struct CollectBodyStream {
+    CollectBodyState *state;
+    CollectBodyStream(CollectBodyState *state) : state(state) {}
+    CollectBodyStream(CollectBodyStream &&other) noexcept : state(other.state) { other.state = nullptr; }
+    CollectBodyStream(const CollectBodyStream &) = delete;
+    CollectBodyStream &operator=(const CollectBodyStream &) = delete;
+    ~CollectBodyStream() { delete state; }
+
+    void operator()(std::string_view data, uint64_t maxRemainingBodyLength) {
+        if (!currentPerContextData || !state) {
+            return;
+        }
+        Isolate *isolate = currentPerContextData->isolate;
+        HandleScope hs(isolate);
+
+        if (state->overflow) {
+            return;
+        } else if (!state->buffer) {
+            /* First and possibly only chunk */
+            if (data.size() > state->maxSize) {
+                /* Overflow: return to JS with null */
+                state->overflow = true;
+                Local<Value> argv[] = {Null(isolate)};
+                CallJS(isolate, state->p.Get(isolate), 1, argv);
+            } else if (maxRemainingBodyLength == 0) {
+                /* Fast path: Single-chunk zero-copy: wrap data directly, detach after call like onData */
+                Local<ArrayBuffer> ab = ArrayBuffer_New(isolate, (void *) data.data(), data.size());
+                Local<Value> argv[] = {ab};
+                CallJS(isolate, state->p.Get(isolate), 1, argv);
+                ab->Detach();
+            } else {
+                /* Slow path begins: allocate buffer lazily for first non-terminal chunk */
+                state->buffer = std::make_unique<std::vector<char>>();
+                if (maxRemainingBodyLength <= state->maxSize - data.size()) {
+                    /* Preallocate with a hint, clamped so a client's Content-Length cannot demand an
+                     * unbounded reserve (a huge hint used to throw std::bad_alloc out of the loop) */
+                    state->buffer->reserve(std::min<size_t>(maxRemainingBodyLength + data.size(), COLLECT_BODY_MAX_RESERVE));
+                }
+                state->buffer->assign(data.begin(), data.end());
+            }
+        } else if (data.size() > state->maxSize - state->buffer->size()) {
+            /* Subsequent chunks Overflow: return to JS with null */
+            state->buffer.reset();
+            state->overflow = true;
+            Local<Value> argv[] = {Null(isolate)};
+            CallJS(isolate, state->p.Get(isolate), 1, argv);
+        } else {
+            /* Subsequent chunks: accumulate */
+            state->buffer->insert(state->buffer->end(), data.begin(), data.end());
+            if (maxRemainingBodyLength == 0) {
+                /* Zero-copy: hand V8 the vector's own memory via a custom deleter. release() also
+                 * nulls the state's pointer, so the vector is freed exactly once, by the backing store. */
+                auto *rawBuffer = state->buffer.release();
+                auto backingStore = ArrayBuffer::NewBackingStore(
+                    rawBuffer->data(), rawBuffer->size(),
+                    [](void *, size_t, void *deleter_data) {
+                        delete static_cast<std::vector<char> *>(deleter_data);
+                    },
+                    rawBuffer
+                );
+                Local<ArrayBuffer> ab = ArrayBuffer::New(isolate, std::move(backingStore));
+                Local<Value> argv[] = {ab};
+                CallJS(isolate, state->p.Get(isolate), 1, argv);
+            }
+        }
+    }
+};
 
 /* PROTOCOL is 0 = TCP, 1 = TLS, 2 = QUIC, 3 = CACHE */
 
@@ -29,8 +121,24 @@ struct HttpResponseWrapper {
 
     static void assumeCorked() {
         if (!insideCorkCallback) {
-            std::cerr << "Warning: uWS.HttpResponse writes must be made from within a corked callback. See documentation for uWS.HttpResponse.cork and consult the user manual." << std::endl;
+            /* Warn at most once per process: this runs on the write path, and an unbuffered
+             * std::cerr write here means one syscall per header for any response written outside
+             * the synchronous handler window. */
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                std::cerr << "Warning: uWS.HttpResponse writes must be made from within a corked callback. See documentation for uWS.HttpResponse.cork and consult the user manual." << std::endl;
+            }
         }
+    }
+
+    /* Mirrors invalidSocket in src/addon.cpp: reject a non-function before Local<Function>::Cast,
+     * which is unchecked in a release build and would produce a bogus handle that dies when called */
+    static inline bool invalidFunction(const FunctionCallbackInfo<Value> &args, int index) {
+        if (!args[index]->IsFunction()) {
+            throwTypeError(args, "Passed callback is not a valid function.");
+            return true;
+        }
+        return false;
     }
 
     template <int PROTOCOL>
@@ -94,16 +202,23 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
-            /* This thing perfectly fits in with unique_function, and will Reset on destructor */
-            UniquePersistent<Function> p(isolate, Local<Function>::Cast(args[0]));
+            if (invalidFunction(args, 0)) {
+                return;
+            }
 
-            res->onData([p = std::move(p), isolate](std::string_view data, bool last) {
+            /* One 8-byte nothrow-movable capture: the isolate is read from per-context state so
+             * this closure stays inside MoveOnlyFunction's inline storage (no per-request malloc) */
+            res->onData([p = NothrowGlobal<Function>(isolate, args[0].As<Function>())](std::string_view data, bool last) {
+                if (!currentPerContextData) {
+                    return;
+                }
+                Isolate *isolate = currentPerContextData->isolate;
                 HandleScope hs(isolate);
 
                 Local<ArrayBuffer> dataArrayBuffer = ArrayBuffer_New(isolate, (void *) data.data(), data.length());
 
                 Local<Value> argv[] = {dataArrayBuffer, Boolean::New(isolate, last)};
-                CallJS(isolate, Local<Function>::New(isolate, p), 2, argv);
+                CallJS(isolate, p.Get(isolate), 2, argv);
 
                 dataArrayBuffer->Detach();
             });
@@ -123,68 +238,30 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
-            size_t maxSize = (size_t) args[0]->NumberValue(isolate->GetCurrentContext()).ToChecked();
+            if (missingArguments(2, args)) {
+                return;
+            }
 
-            /* This thing perfectly fits in with unique_function, and will Reset on destructor */
-            UniquePersistent<Function> p(isolate, Local<Function>::Cast(args[1]));
-
-            /* Lazily allocated; nullptr means not yet started. Separate overflow flag distinguishes
-             * the "not started" state from the "exceeded maxSize" state. */
-            std::unique_ptr<std::vector<char>> buffer;
-            bool overflow = false;
-
-            res->onDataV2([p = std::move(p), buffer = std::move(buffer), overflow, maxSize, isolate](std::string_view data, uint64_t maxRemainingBodyLength) mutable {
-                HandleScope hs(isolate);
-
-                if (overflow) {
-                    return;
-                } else if (!buffer) {
-                    /* First and possibly only chunk */
-                    if (data.size() > maxSize) {
-                        /* Overflow: return to JS with null */
-                        overflow = true;
-                        Local<Value> argv[] = {Null(isolate)};
-                        CallJS(isolate, Local<Function>::New(isolate, p), 1, argv);
-                    } else if (maxRemainingBodyLength == 0) {
-                        /* Fast path: Single-chunk zero-copy: wrap data directly, detach after call like onData */
-                        Local<ArrayBuffer> ab = ArrayBuffer_New(isolate, (void *) data.data(), data.size());
-                        Local<Value> argv[] = {ab};
-                        CallJS(isolate, Local<Function>::New(isolate, p), 1, argv);
-                        ab->Detach();
-                    } else {
-                        /* Slow path begins: allocate buffer lazily for first non-terminal chunk */
-                        buffer = std::make_unique<std::vector<char>>();
-                        if (maxRemainingBodyLength <= maxSize - data.size()) {
-                            /* Preallocate with hint */
-                            buffer->reserve(maxRemainingBodyLength + data.size());
-                        }
-                        buffer->assign(data.begin(), data.end());
-                    }
-                } else if (data.size() > maxSize - buffer->size()) {
-                    /* Subsequent chunks Overflow: return to JS with null */
-                    buffer.reset();
-                    overflow = true;
-                    Local<Value> argv[] = {Null(isolate)};
-                    CallJS(isolate, Local<Function>::New(isolate, p), 1, argv);
-                } else {
-                    /* Subsequent chunks: accumulate */
-                    buffer->insert(buffer->end(), data.begin(), data.end());
-                    if (maxRemainingBodyLength == 0) {
-                        /* Zero-copy: hand V8 the vector's own memory via a custom deleter */
-                        auto *rawBuffer = buffer.release();
-                        auto backingStore = ArrayBuffer::NewBackingStore(
-                            rawBuffer->data(), rawBuffer->size(),
-                            [](void *, size_t, void *deleter_data) {
-                                delete static_cast<std::vector<char> *>(deleter_data);
-                            },
-                            rawBuffer
-                        );
-                        Local<ArrayBuffer> ab = ArrayBuffer::New(isolate, std::move(backingStore));
-                        Local<Value> argv[] = {ab};
-                        CallJS(isolate, Local<Function>::New(isolate, p), 1, argv);
-                    }
+            size_t maxSize = 0;
+            ArgReadResult maxSizeResult = readSizeArg(args, 0, 9007199254740991.0, maxSize);
+            if (maxSizeResult != ArgReadResult::Ok) {
+                /* maxSize is required here: undefined/null is as invalid as a bad number */
+                if (maxSizeResult == ArgReadResult::NotProvided) {
+                    throwTypeError(args, "collectBody requires a numeric maxSize.");
                 }
-            });
+                return;
+            }
+
+            if (invalidFunction(args, 1)) {
+                return;
+            }
+
+            /* One explicit heap state, owned by the stream below (see CollectBodyStream) */
+            auto *state = new CollectBodyState();
+            state->p = NothrowGlobal<Function>(isolate, args[1].As<Function>());
+            state->maxSize = maxSize;
+
+            res->onDataV2(CollectBodyStream(state));
 
             args.GetReturnValue().Set(args.This());
         }
@@ -197,17 +274,23 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
-            /* This thing perfectly fits in with unique_function, and will Reset on destructor */
-            UniquePersistent<Function> p(isolate, Local<Function>::Cast(args[0]));
+            if (invalidFunction(args, 0)) {
+                return;
+            }
 
-            res->onDataV2([p = std::move(p), isolate](std::string_view data, uint64_t maxRemainingBodyLength) {
+            /* 8-byte nothrow-movable capture, see res_onData */
+            res->onDataV2([p = NothrowGlobal<Function>(isolate, args[0].As<Function>())](std::string_view data, uint64_t maxRemainingBodyLength) {
+                if (!currentPerContextData) {
+                    return;
+                }
+                Isolate *isolate = currentPerContextData->isolate;
                 HandleScope hs(isolate);
 
                 Local<ArrayBuffer> dataArrayBuffer = ArrayBuffer_New(isolate, (void *) data.data(), data.length());
 
                 /* Pass maxRemainingBodyLength so user can preallocate; 0 signals the last chunk */
                 Local<Value> argv[] = {dataArrayBuffer, BigInt::NewFromUnsigned(isolate, maxRemainingBodyLength)};
-                CallJS(isolate, Local<Function>::New(isolate, p), 2, argv);
+                CallJS(isolate, p.Get(isolate), 2, argv);
 
                 dataArrayBuffer->Detach();
             });
@@ -222,19 +305,24 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
-            /* This thing perfectly fits in with unique_function, and will Reset on destructor */
-            UniquePersistent<Function> p(isolate, Local<Function>::Cast(args[0]));
+            if (invalidFunction(args, 0)) {
+                return;
+            }
 
-            /* This is how we capture res (C++ this in invocation of this function) */
-            UniquePersistent<Object> resObject(isolate, args.This());
-
-            res->onAborted([p = std::move(p), resObject = std::move(resObject), isolate]() {
+            /* 16 bytes and nothrow-movable: fits in MoveOnlyFunction's inline storage. This is the
+             * one callback that must still work after this JS object is dead, hence the capture of
+             * the object itself and not just the handler. */
+            res->onAborted([p = NothrowGlobal<Function>(isolate, args[0].As<Function>()), resObject = NothrowGlobal<Object>(isolate, args.This())]() {
+                if (!currentPerContextData) {
+                    return;
+                }
+                Isolate *isolate = currentPerContextData->isolate;
                 HandleScope hs(isolate);
 
                 /* Mark this resObject invalid */
-                setInternalPointer(Local<Object>::New(isolate, resObject), nullptr);//->SetAlignedPointerInInternalField(0, nullptr);
+                setInternalPointer(resObject.Get(isolate), nullptr);
 
-                CallJS(isolate, Local<Function>::New(isolate, p), 0, nullptr);
+                CallJS(isolate, p.Get(isolate), 0, nullptr);
             });
 
             args.GetReturnValue().Set(args.This());
@@ -331,7 +419,7 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
-            args.GetReturnValue().Set(Number::New(isolate, getHttpResponse<SSL>(args)->getWriteOffset()));
+            args.GetReturnValue().Set(Number::New(isolate, res->getWriteOffset()));
         }
     }
 
@@ -341,16 +429,23 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
-            /* This thing perfectly fits in with unique_function, and will Reset on destructor */
-            UniquePersistent<Function> p(isolate, Local<Function>::Cast(args[0]));
+            if (invalidFunction(args, 0)) {
+                return;
+            }
 
-            res->onWritable([p = std::move(p), isolate](size_t offset) -> bool {
+            /* 8-byte nothrow-movable capture, see res_onData */
+            res->onWritable([p = NothrowGlobal<Function>(isolate, args[0].As<Function>())](size_t offset) -> bool {
+                if (!currentPerContextData) {
+                    /* The default should be true, as it only adds a potential extra send, rather than erroneously avoid it */
+                    return true;
+                }
+                Isolate *isolate = currentPerContextData->isolate;
                 HandleScope hs(isolate);
 
                 Local<Value> argv[] = {Number::New(isolate, offset)};
 
                 /* We should check if this is really here! */
-                MaybeLocal<Value> maybeBoolean = CallJS(isolate, Local<Function>::New(isolate, p), 1, argv);
+                MaybeLocal<Value> maybeBoolean = CallJS(isolate, p.Get(isolate), 1, argv);
                 if (maybeBoolean.IsEmpty()) {
                     std::cerr << "Warning: uWS.HttpResponse.onWritable callback should return Boolean. See documentation for uWS.HttpResponse.onWritable and consult the user manual." << std::endl;
                     /* The default should be true, as it only adds a potential extra send, rather than erroneously avoid it */
@@ -365,13 +460,25 @@ struct HttpResponseWrapper {
         }
     }
 
-    /* Takes string or arraybuffer, returns this */
+    /* Takes string or arraybuffer, returns this.
+     * The status line is written one byte per code unit (latin-1), like Node, so anything above
+     * U+00FF is rejected before encoding and the encoded bytes are validated for CR/LF. */
     template <int SSL>
     static void res_writeStatus(const FunctionCallbackInfo<Value> &args) {
         auto *res = getHttpResponse<SSL>(args);
             if (res) {
-            NativeString<true> data(args.GetIsolate(), args[0]);
+            if (args[0]->IsString() && !isLatin1String(args[0])) {
+                throwTypeError(args, "Characters above U+00FF are not allowed in a status line or header");
+                return;
+            }
+
+            NativeStringOneByte data(args.GetIsolate(), args[0]);
             if (data.isInvalid(args)) {
+                return;
+            }
+
+            if (!isValidStatusLine(data.getString())) {
+                throwTypeError(args, "Invalid character in header content");
                 return;
             }
 
@@ -389,7 +496,14 @@ struct HttpResponseWrapper {
         if (res) {
             std::optional<size_t> reportedContentLength;
             if (args.Length() >= 1) {
-                reportedContentLength = (size_t) args[0]->NumberValue(args.GetIsolate()->GetCurrentContext()).ToChecked();
+                size_t reported = 0;
+                ArgReadResult result = readSizeArg(args, 0, 9007199254740991.0, reported);
+                if (result == ArgReadResult::Failed) {
+                    return;
+                }
+                if (result == ArgReadResult::Ok) {
+                    reportedContentLength = reported;
+                }
             }
 
             bool closeConnection = false;
@@ -441,7 +555,11 @@ struct HttpResponseWrapper {
 
             size_t totalSize = 0;
             if (args.Length() > 1) {
-                totalSize = (size_t) args[1]->NumberValue(isolate->GetCurrentContext()).ToChecked();
+                ArgReadResult result = readSizeArg(args, 1, 9007199254740991.0, totalSize);
+                if (result == ArgReadResult::Failed) {
+                    return;
+                }
+                /* NotProvided leaves totalSize at 0: internalEnd already treats 0 as "this chunk is everything" */
             }
 
             assumeCorked();
@@ -491,22 +609,38 @@ struct HttpResponseWrapper {
         }
     }
 
-    /* Takes key, value. Returns this */
+    /* Takes key, value. Returns this.
+     * Header names and values are written one byte per code unit (latin-1), like Node; anything
+     * above U+00FF is rejected before encoding and the encoded bytes are validated so a header
+     * name cannot carry ':'/SP/CR/LF and a value cannot carry control characters. */
     template <int PROTOCOL>
     static void res_writeHeader(const FunctionCallbackInfo<Value> &args) {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<PROTOCOL>(args);
         if (res) {
-            // Optimization: writeHeader never calls JS or allocated on the GC
-            // use zero copy string view in best case
-            NativeString<true> header(args.GetIsolate(), args[0]);
+            if ((args[0]->IsString() && !isLatin1String(args[0])) || (args[1]->IsString() && !isLatin1String(args[1]))) {
+                throwTypeError(args, "Characters above U+00FF are not allowed in a status line or header");
+                return;
+            }
+
+            NativeStringOneByte header(args.GetIsolate(), args[0]);
             if (header.isInvalid(args)) {
                 return;
             }
-            NativeString<true> value(args.GetIsolate(), args[1]);
+            NativeStringOneByte value(args.GetIsolate(), args[1]);
             if (value.isInvalid(args)) {
                 return;
             }
+
+            if (!isValidHeaderName(header.getString())) {
+                throwTypeError(args, "Invalid HTTP header name");
+                return;
+            }
+            if (!isValidHeaderValue(value.getString())) {
+                throwTypeError(args, "Invalid character in header content");
+                return;
+            }
+
             assumeCorked();
             res->writeHeader(header.getString(), value.getString());
 
@@ -520,6 +654,9 @@ struct HttpResponseWrapper {
         Isolate *isolate = args.GetIsolate();
         auto *res = getHttpResponse<SSL>(args);
         if (res) {
+            if (invalidFunction(args, 0)) {
+                return;
+            }
 
             res->cork([cb = Local<Function>::Cast(args[0]), isolate]() {
                 insideCorkCallback++;
@@ -540,6 +677,17 @@ struct HttpResponseWrapper {
         if (res) {
             /* We require exactly 5 arguments */
             if (args.Length() != 5) {
+                return;
+            }
+
+            /* Both casts below are unchecked in a release build: reject anything that is not the
+             * External context handed to the upgrade handler / an object to merge userData from */
+            if (!args[0]->IsObject()) {
+                throwTypeError(args, "res.upgrade userData must be an object");
+                return;
+            }
+            if (!args[4]->IsExternal()) {
+                throwTypeError(args, "res.upgrade requires the context passed to the upgrade handler");
                 return;
             }
 

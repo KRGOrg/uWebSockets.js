@@ -41,7 +41,7 @@ struct HttpRequestWrapper {
         }
     }
 
-    /* Takes function of string, string. Returns this (doesn't really but should) */
+    /* Takes function of string, string. Returns this */
     template <int QUIC>
     static void req_forEach(const FunctionCallbackInfo<Value> &args) {
         Isolate *isolate = args.GetIsolate();
@@ -50,11 +50,16 @@ struct HttpRequestWrapper {
             Local<Function> cb = Local<Function>::Cast(args[0]);
 
             for (auto p : *req) {
-                Local<Value> argv[] = {String::NewFromUtf8(isolate, p.first.data(), NewStringType::kNormal, p.first.length()).ToLocalChecked(),
-                                       String::NewFromUtf8(isolate, p.second.data(), NewStringType::kNormal, p.second.length()).ToLocalChecked()};
+                /* Header names are ASCII tokens by the parser's contract; values are
+                 * decoded one byte per code unit (latin-1) so that forEach agrees with
+                 * getHeader instead of mangling the same bytes differently */
+                Local<Value> argv[] = {String::NewFromOneByte(isolate, (const uint8_t *) p.first.data(), NewStringType::kNormal, (int) p.first.length()).ToLocalChecked(),
+                                       String::NewFromOneByte(isolate, (const uint8_t *) p.second.data(), NewStringType::kNormal, (int) p.second.length()).ToLocalChecked()};
                 /* This one is also called from JS so no need for CallJS */
                 cb->Call(isolate->GetCurrentContext(), isolate->GetCurrentContext()->Global(), 2, argv).IsEmpty();
             }
+
+            args.GetReturnValue().Set(args.This());
         }
     }
 

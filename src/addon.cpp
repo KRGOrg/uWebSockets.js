@@ -115,36 +115,33 @@ void uWS_getParts(const FunctionCallbackInfo<Value> &args) {
 
 //UniquePersistent<Function> timerCallbacksJS[1000];
 
+/* These three are registered exports but have no implementation in this build
+ * (src/FastTimers.h is not compiled), so they used to hand back undefined and never fire
+ * the callback - a silent no-op, which is the worst of the options. They now fail loudly;
+ * removing the exports would be a breaking change, and a real implementation would need a
+ * timer subsystem on the loop that is out of scope here. */
 void uWS_arm(const FunctionCallbackInfo<Value> &args) {
 
     /* integer */
 
-    uint32_t ms = Local<Integer>::Cast(args[0])->Value();
-
-
-    //unsigned int timer = setTimeout_(nullptr, 1000);
+    Isolate *isolate = args.GetIsolate();
+    args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::Error(String::NewFromUtf8(isolate, "uWS.arm is not implemented in this build; use Node's own timers instead.", NewStringType::kNormal).ToLocalChecked())));
 }
 
 void uWS_setTimeout(const FunctionCallbackInfo<Value> &args) {
 
     /* Function, integer */
 
-    //unsigned int timer = setTimeout_(nullptr, 1000);
-
-    //timerCallbacksJS[timer].Reset(args.GetIsolate(), Local<Function>::Cast(args[0]));
-
-    //args.GetReturnValue().Set(Integer::New(args.GetIsolate(), timer));
+    Isolate *isolate = args.GetIsolate();
+    args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::Error(String::NewFromUtf8(isolate, "uWS.setTimeout is not implemented in this build; use Node's own timers instead.", NewStringType::kNormal).ToLocalChecked())));
 }
 
 void uWS_clearTimeout(const FunctionCallbackInfo<Value> &args) {
 
     /* Integer */
 
-    uint32_t timer = Local<Integer>::Cast(args[0])->Value();
-
-    //clearTimeout_(timer);
-
-    //timerCallbacksJS[timer].Reset();
+    Isolate *isolate = args.GetIsolate();
+    args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::Error(String::NewFromUtf8(isolate, "uWS.clearTimeout is not implemented in this build; use Node's own timers instead.", NewStringType::kNormal).ToLocalChecked())));
 }
 
 /* Pass various undocumented configs */
@@ -154,8 +151,9 @@ void uWS_cfg(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    int keyCode = std::accumulate(key.getString().begin(), key.getString().end(), 1, std::plus<int>());
-    if (keyCode == 656) {
+    /* Compare the key as a real string: the previous character-sum check treated any
+     * anagram ("listen", "tinsel", "enlist") as "silent" and silenced the server. */
+    if (key.getString() == "silent") {
         uWS::Loop::get()->setSilent(true);
     }
 }
@@ -195,7 +193,17 @@ void uWS_us_socket_local_port(const FunctionCallbackInfo<Value> &args) {
 
 std::unordered_map<std::string, std::unordered_map<std::string, std::string>> kvStoreString;
 std::unordered_map<std::string, std::unordered_map<std::string, uint32_t>> kvStoreInteger;
-std::mutex kvMutex;
+
+/* The store itself is shared by every worker thread of the process; the JS-facing
+ * uWS.lock()/uWS.unlock() pair was always cooperative (no KV function ever took it), so
+ * each KV function guards the map access with its own mutex. Kept separate from the client
+ * lock so a client lock left held can no longer wedge the store. */
+std::mutex kvStoreMutex;
+
+/* Re-entrant so a double uWS.lock() cannot self-deadlock, and mismatched uWS.unlock()
+ * becomes a catchable Error instead of undefined behaviour */
+std::recursive_mutex kvClientMutex;
+thread_local int kvLockDepth = 0;
 
 // getString(key, collection)
 void uWS_getString(const FunctionCallbackInfo<Value> &args) {
@@ -209,7 +217,11 @@ void uWS_getString(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    std::string value = kvStoreString[std::string(collection.getString())][std::string(key.getString())];
+    std::string value;
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        value = kvStoreString[std::string(collection.getString())][std::string(key.getString())];
+    }
 
     args.GetReturnValue().Set(String::NewFromUtf8(args.GetIsolate(), value.data(), NewStringType::kNormal, value.length()).ToLocalChecked());
 }
@@ -229,7 +241,10 @@ void uWS_setString(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    kvStoreString[std::string(collection.getString())][std::string(key.getString())] = value.getString();
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        kvStoreString[std::string(collection.getString())][std::string(key.getString())] = value.getString();
+    }
 }
 
 void uWS_getInteger(const FunctionCallbackInfo<Value> &args) {
@@ -243,7 +258,11 @@ void uWS_getInteger(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    uint32_t value = kvStoreInteger[std::string(collection.getString())][std::string(key.getString())];
+    uint32_t value;
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        value = kvStoreInteger[std::string(collection.getString())][std::string(key.getString())];
+    }
 
     args.GetReturnValue().Set(Integer::New(args.GetIsolate(), value));
 }
@@ -261,7 +280,10 @@ void uWS_setInteger(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    kvStoreInteger[std::string(collection.getString())][std::string(key.getString())] = value;
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        kvStoreInteger[std::string(collection.getString())][std::string(key.getString())] = value;
+    }
 }
 
 void uWS_incInteger(const FunctionCallbackInfo<Value> &args) {
@@ -277,7 +299,11 @@ void uWS_incInteger(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    uint32_t value = kvStoreInteger[std::string(collection.getString())][std::string(key.getString())] += change;
+    uint32_t value;
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        value = kvStoreInteger[std::string(collection.getString())][std::string(key.getString())] += change;
+    }
 
     args.GetReturnValue().Set(Integer::New(args.GetIsolate(), value));
 }
@@ -290,6 +316,8 @@ void uWS_getStringKeys(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
+    /* Held while the array is built: no JS callback is invoked in this loop */
+    std::lock_guard<std::mutex> guard(kvStoreMutex);
     auto &keys = kvStoreString[std::string(collection.getString())];
 
     Local<Array> stringKeys = Array::New(args.GetIsolate(), keys.size());
@@ -310,6 +338,8 @@ void uWS_getIntegerKeys(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
+    /* Held while the array is built: no JS callback is invoked in this loop */
+    std::lock_guard<std::mutex> guard(kvStoreMutex);
     auto &keys = kvStoreInteger[std::string(collection.getString())];
 
     Local<Array> integerKeys = Array::New(args.GetIsolate(), keys.size());
@@ -335,7 +365,10 @@ void uWS_deleteString(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    kvStoreString[std::string(collection.getString())].erase(std::string(key.getString()));
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        kvStoreString[std::string(collection.getString())].erase(std::string(key.getString()));
+    }
 
     //args.GetReturnValue().Set(Integer::New(args.GetIsolate(), value));
 }
@@ -352,7 +385,10 @@ void uWS_deleteInteger(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    kvStoreInteger[std::string(collection.getString())].erase(std::string(key.getString()));
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        kvStoreInteger[std::string(collection.getString())].erase(std::string(key.getString()));
+    }
 
     //args.GetReturnValue().Set(Integer::New(args.GetIsolate(), value));
 }
@@ -364,7 +400,10 @@ void uWS_deleteStringCollection(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    kvStoreString.erase(std::string(collection.getString()));
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        kvStoreString.erase(std::string(collection.getString()));
+    }
 
     //args.GetReturnValue().Set(integerKeys);
 }
@@ -376,17 +415,29 @@ void uWS_deleteIntegerCollection(const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
-    kvStoreInteger.erase(std::string(collection.getString()));
+    {
+        std::lock_guard<std::mutex> guard(kvStoreMutex);
+        kvStoreInteger.erase(std::string(collection.getString()));
+    }
 
     //args.GetReturnValue().Set(integerKeys);
 }
 
 void uWS_lock(const FunctionCallbackInfo<Value> &args) {
-    kvMutex.lock();
+    if (kvLockDepth++ == 0) {
+        kvClientMutex.lock();
+    }
 }
 
 void uWS_unlock(const FunctionCallbackInfo<Value> &args) {
-    kvMutex.unlock();
+    if (kvLockDepth == 0) {
+        Isolate *isolate = args.GetIsolate();
+        args.GetReturnValue().Set(isolate->ThrowException(v8::Exception::Error(String::NewFromUtf8(isolate, "uWS.unlock called without a matching uWS.lock().", NewStringType::kNormal).ToLocalChecked())));
+        return;
+    }
+    if (--kvLockDepth == 0) {
+        kvClientMutex.unlock();
+    }
 }
 
 PerContextData *Main(Isolate *isolate, Local<Object> exports) {
@@ -394,6 +445,9 @@ PerContextData *Main(Isolate *isolate, Local<Object> exports) {
     /* Init the template objects, SSL and non-SSL, store it in per context data */
     PerContextData *perContextData = new PerContextData;
     perContextData->isolate = isolate;
+    /* Let callbacks reach the isolate without capturing it (see src/Utilities.h); this
+     * pointer must stay valid until the cleanup hook deletes PerContextData */
+    currentPerContextData = perContextData;
     perContextData->reqTemplate[0].Reset(isolate, HttpRequestWrapper::init<false>(isolate));
     perContextData->reqTemplate[1].Reset(isolate, HttpRequestWrapper::init<true>(isolate));
     perContextData->resTemplate[0].Reset(isolate, HttpResponseWrapper::init<0>(isolate));
@@ -483,6 +537,9 @@ NODE_MODULE_INITIALIZER(Local<Object> exports, Local<Value> module, Local<Contex
     node::AddEnvironmentCleanupHook(isolate, [](void *arg) {
 
         PerContextData *perContextData = (PerContextData *) arg;
+
+        /* Descriptors must stop being accepted before the apps they point to go away */
+        uWS_unregisterLiveAppsFor(perContextData);
 
         /* Freeing apps here, it could be done earlier but not sooner */
         perContextData->apps.clear();
