@@ -1,0 +1,6 @@
+# Build output
+a.out
+*.o
+dist/
+targets/
+node-v*-headers.tar.gz
